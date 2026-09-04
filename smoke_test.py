@@ -8,8 +8,14 @@ It checks two things:
        and finishes the level without crashing.
 
 Run:  python smoke_test.py    (exit code 0 = all good)
+
+SAFETY NOTE: walking the lesson flow calls the same code the real game does,
+and that code SAVES YOUR PROGRESS. So this test copies progress.json aside
+before it starts and puts it back at the end -- running the tests must never
+cost you your place in the campaign.
 """
 import os
+import shutil
 os.environ["SDL_VIDEODRIVER"] = "dummy"   # no real window needed
 os.environ["SDL_AUDIODRIVER"] = "dummy"
 
@@ -85,11 +91,28 @@ def walk_flow():
 
 
 if __name__ == "__main__":
-    print("Checking that each task's solution passes its check():")
-    fails = check_solutions()
-    print("\nWalking the full lesson flow:")
-    phases = walk_flow()
-    print("  phases visited:", " -> ".join(dict.fromkeys(phases)))
+    # Put the real save somewhere safe for the duration of the test.
+    backup = None
+    if os.path.exists(main.SAVE_PATH):
+        backup = main.SAVE_PATH + ".smokebak"
+        shutil.copyfile(main.SAVE_PATH, backup)
+
+    try:
+        print("Checking that each task's solution passes its check():")
+        fails = check_solutions()
+        print("\nWalking the full lesson flow:")
+        phases = walk_flow()
+        print("  phases visited:", " -> ".join(dict.fromkeys(phases)))
+    finally:
+        # Whatever happened above, the player's progress goes back exactly as
+        # it was. Level 23's tests also leave a ship_log.txt behind; bin it.
+        if backup:
+            shutil.copyfile(backup, main.SAVE_PATH)
+            os.remove(backup)
+            print("\n  (your saved progress was restored untouched)")
+        log = os.path.join(os.path.dirname(main.SAVE_PATH), "ship_log.txt")
+        if os.path.exists(log):
+            os.remove(log)
 
     print()
     if fails:

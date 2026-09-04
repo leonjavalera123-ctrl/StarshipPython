@@ -20,12 +20,14 @@ import os
 import sys
 import json
 import math
+import time
 import pygame
 
 from engine import (WIDTH, HEIGHT, FPS, COLORS, font, draw_text, draw_panel,
                     text_height, Button, Starfield, Scene)
 from pyterminal import PyTerminal
 import sfx                      # tiny sound-effects helper (safe if no audio)
+import handoff                  # lets the 3D ship game ask us to run one level
 
 # Import each level's data. To add a level, import it and add it to LEVELS.
 from levels import (level1_power, level2_oxygen, level3_comms, level4_navigation,
@@ -83,6 +85,21 @@ def main_count():
 
 
 # ---------------------------------------------------------------------------
+# HANDOFF MODE  (only ever switched on by the 3D ship game)
+# ---------------------------------------------------------------------------
+# Normally both of these stay exactly as they are below and the game behaves
+# the way it always has. They only change when we were started with
+# "--level N" on the command line -- see the bottom of this file.
+#
+#   REQUEST      what the ship asked for, or None for a normal double-click.
+#   SAVE_LOCKED  True means "do not touch progress.json". The ship is borrowing
+#                the game to run one level; the cadet's own campaign save must
+#                come out of that completely untouched.
+REQUEST = None
+SAVE_LOCKED = False
+
+
+# ---------------------------------------------------------------------------
 # SAVING YOUR PROGRESS
 # ---------------------------------------------------------------------------
 # We remember the highest level you've unlocked in a tiny file next to this one
@@ -104,7 +121,12 @@ def save_game(game):
     'unlocked' = how many levels are finished (gating + progress count).
     'level'/'task' = the EXACT spot to resume -- the level you're on and which
     practice task -- so closing mid-level still continues right where you were.
+
+    In handoff mode this does nothing at all: the 3D ship keeps its own save,
+    and a level played from the ship must never move the cadet's own bookmark.
     """
+    if SAVE_LOCKED:
+        return
     try:
         with open(SAVE_PATH, "w") as f:
             json.dump({
@@ -353,7 +375,41 @@ class LevelScene(Scene):
         self.anim_t = 0.0           # a free-running clock for PYX's blinking
         self.scroll = 0             # pixels scrolled down in long text panels
 
+        # Scorekeeping for the 3D ship. These four tick along quietly during
+        # normal play too -- nothing reads them unless we're in handoff mode.
+        self.resets = 0             # times "Reset code" was pressed
+        self.hints_used = 0         # hint rungs revealed across the whole level
+        self.full_answers = 0       # tasks where the LAST rung (the answer) showed
+        self.started_at = time.monotonic()   # a stopwatch for this session
+        self.reported = False       # have we already answered the ship?
+
         self.set_phase("brief")
+
+    def report(self, cleared):
+        """Tell the 3D ship how this session went. Does nothing in normal play.
+
+        Only ever answers ONCE per session: whoever gets here first wins, so a
+        finished level can't later be overwritten by the window closing.
+        """
+        if REQUEST is None or self.reported:
+            return
+        self.reported = True
+        # How many hint rungs this level offers in total. Boss levels have NO
+        # hints at all, so this is 0 for them -- which is how the ship knows not
+        # to grade a boss as "used no hints, therefore easy".
+        hints_available = sum(len(t.get("hints") or [])
+                              for t in self.level["practice"])
+        handoff.write_report(REQUEST["report"], {
+            "session": REQUEST["session"],
+            "level": self.index + 1,          # 1-based, matching --level
+            "cleared": bool(cleared),
+            "tasks": len(self.level["practice"]),
+            "hints_used": self.hints_used,
+            "hints_available": hints_available,
+            "full_answer_reveals": self.full_answers,
+            "resets": self.resets,
+            "duration": round(time.monotonic() - self.started_at, 1),
+        })
 
     # -- switch to a new phase and prepare anything it needs ----------------
     def set_phase(self, phase):
@@ -465,6 +521,7 @@ class LevelScene(Scene):
         rect = pygame.Rect(24, 184, 632, 430)
         self.terminal = PyTerminal(rect, seed=dict(task.get("seed", {})),
                                    intro=task.get("intro"))
+        self.resets += 1            # the ship counts these (cosmetic only)
         sfx.play("blip")
 
     # ----------------------------------------------------------------- input
@@ -519,7 +576,12 @@ class LevelScene(Scene):
             if task.get("hints") and self.hint_btn.handle_event(event):
                 if self.hints_shown < len(task["hints"]):
                     self.hints_shown += 1
+                    self.hints_used += 1        # hints are FREE -- just counted
                 if self.hints_shown >= len(task["hints"]):
+                    if self.hint_btn.enabled:
+                        # The last rung IS the answer, so note it once per task.
+                        # (A boss task has no hints, so it can never land here.)
+                        self.full_answers += 1
                     self.hint_btn.enabled = False
                     self.hint_btn.label = "(that's the full answer)"
             # "Reset code" wipes the box clean if your attempts got messy.
@@ -534,6 +596,13 @@ class LevelScene(Scene):
                     self.set_phase("repair")
 
     def _go_next_level(self):
+        # HANDOFF MODE: the ship asked for THIS level only. Report the good news
+        # and close, so the 3D game gets control back instead of us rolling on
+        # into the next level.
+        if REQUEST is not None:
+            self.report(cleared=True)
+            self.next_scene = "quit"
+            return
         # Finishing this level unlocks the next one. Remember it on disk.
         self.game.unlocked = max(self.game.unlocked, self.index + 1)
         save_game(self.game)
@@ -841,7 +910,21 @@ class Game:
         self.fx_on = bool(st.get("fx", True))       # sound effects on/off
         self.type_idx = int(st.get("type", 1))      # 0..2 (Slow/Normal/Fast)
         apply_settings(self)
+        # In handoff mode, ESC asks "leave session?" first. This is that question
+        # being on screen. It stays False for the whole of normal play.
+        self.confirm_quit = False
         self.scene = TitleScene(self)     # the first screen
+
+    def handoff_bail(self):
+        """Leaving early: tell the ship the system was NOT certified.
+
+        Called when the window is closed or the cadet answers Y to the "leave
+        session?" question. If the level was already finished, `report` has
+        happened once already and quietly ignores us.
+        """
+        reporter = getattr(self.scene, "report", None)
+        if REQUEST is not None and callable(reporter):
+            reporter(cleared=False)
 
     def toggle_fullscreen(self):
         """Switch between a window and fullscreen (the game scales to fit)."""
@@ -858,12 +941,27 @@ class Game:
             dt = self.clock.tick(FPS) / 1000.0
 
             for event in pygame.event.get():
+                # While the "leave session?" question is up it owns the keyboard,
+                # so a stray keypress can't reach the code terminal behind it.
+                if self.confirm_quit and event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_y:
+                        self.handoff_bail()
+                        running = False
+                    elif event.key in (pygame.K_n, pygame.K_ESCAPE):
+                        self.confirm_quit = False
+                    continue
+
                 if event.type == pygame.QUIT:
+                    self.handoff_bail()     # closing the window = not certified
                     running = False
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    # In handoff mode the ship is waiting on us, and the title
+                    # screen isn't ours to go to -- so ESC asks first instead.
+                    if REQUEST is not None:
+                        self.confirm_quit = True
                     # ESC quits from the title, but elsewhere just bails to the
                     # title (so you never lose the whole game by mistake).
-                    if isinstance(self.scene, TitleScene):
+                    elif isinstance(self.scene, TitleScene):
                         running = False
                     else:
                         self.scene = TitleScene(self)
@@ -895,11 +993,36 @@ class Game:
             if sfx.is_muted():              # a quiet reminder that audio is off
                 draw_text(self.screen, "MUTED (M)", 16, HEIGHT - 26, size=14,
                           color="gray")
+            if self.confirm_quit:
+                self._draw_confirm(self.screen)
             pygame.display.flip()           # show the freshly drawn frame
 
         pygame.quit()
         sys.exit()
 
+    def _draw_confirm(self, surface):
+        """The one-line "are you sure?" asked when ESC is pressed on the ship."""
+        box = pygame.Rect(140, 296, WIDTH - 280, 108)
+        draw_panel(surface, box, fill="panel", border="amber")
+        draw_text(surface, "Leave session? Progress on this task is kept "
+                  "next time.", WIDTH // 2, box.y + 24, size=20, color="star",
+                  center=True)
+        draw_text(surface, "Y = leave    N = keep going", WIDTH // 2,
+                  box.y + 62, size=20, color="amber", center=True)
+
 
 if __name__ == "__main__":
-    Game().run()
+    # Did the 3D ship game start us with "--level N"? If it didn't, REQUEST is
+    # None, nothing below changes, and the game opens on its title screen
+    # exactly as it always has.
+    REQUEST = handoff.read_request()
+    if REQUEST is not None:
+        SAVE_LOCKED = True          # hands off the cadet's own progress.json
+    game = Game()
+    if REQUEST is not None:
+        # Jump straight into the level the ship asked for. --level is 1-based
+        # (level 1 is the first one), and we clamp it so a silly number can
+        # never crash us.
+        i = max(0, min(len(LEVELS) - 1, REQUEST["level"] - 1))
+        game.scene = LevelScene(game, LEVELS[i], i)
+    game.run()
